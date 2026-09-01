@@ -34,7 +34,10 @@ export const FAMILY_LABEL: Record<PowerFamily, string> = {
   echo: "Echo",
 };
 
-// --- Basic attack: always available, even with an empty build --------------
+// --- Shared melee-cone constants: not a standalone attack of their own -----
+// (the player starts with no attack --- the first is always stolen). Echo
+// reuses these directly as its own melee-cone shape, and Clone's per-hit
+// stats (CLONE_DAMAGE/CLONE_RANGE, below) alias them too.
 
 export const BASIC_DAMAGE = 8;
 export const BASIC_RANGE = 60;

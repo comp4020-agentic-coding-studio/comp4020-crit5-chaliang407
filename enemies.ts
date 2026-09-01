@@ -16,7 +16,7 @@ import type { Vec2 } from "./game.ts";
 import { ALL_FAMILIES, HEADLINE_PAIRS, type PowerFamily } from "./powers.ts";
 import { type Rng, pickIndex } from "./rng.ts";
 
-export type EnemyKind = "phantom" | "thrower" | "duplicate" | "anchor" | "sentinel" | "reverberant" | "boss";
+export type EnemyKind = "phantom" | "thrower" | "duplicate" | "anchor" | "sentinel" | "reverberant" | "husk" | "boss";
 
 export const ENEMY_FAMILY: Record<EnemyKind, PowerFamily | null> = {
   phantom: "blink",
@@ -25,6 +25,7 @@ export const ENEMY_FAMILY: Record<EnemyKind, PowerFamily | null> = {
   anchor: "blackhole",
   sentinel: "orbit",
   reverberant: "echo",
+  husk: null,
   boss: null,
 };
 
@@ -41,7 +42,9 @@ export interface EnemyState {
   telegraphDuration: number; // for renderer: how long the current telegraph is, to normalise a 0..1 ratio
   invulnerable: boolean; // blocks player attack damage (not dash)
   dashResistant: boolean; // blocks dash-kill outright (only the boss, outside its exposed window)
-  exposed: boolean; // boss only: standing still, dash-killable, glowing
+  exposed: boolean; // in BREAK: standing still, dash-killable, glowing
+  armIntroBreak: boolean; // this enemy's own attack cycle (not player damage) will open BREAK once it completes
+  introAttackFired: boolean; // set once an armIntroBreak enemy has been seen telegraphing, so BREAK waits for its full cycle
   elite: boolean; // bigger, tougher variant; grants a mutated version of its family on steal
   orbitAngle: number; // sentinel's passive ring; also phantom's deterministic teleport-angle accumulator,
   // and the boss's rotation while it holds a stolen Orbit or its stolen-power action cooldown driver
@@ -92,6 +95,7 @@ const BASE_MAX_HP: Record<EnemyKind, number> = {
   anchor: 64,
   sentinel: 70,
   reverberant: 44,
+  husk: 20,
   boss: 170,
 };
 const ELITE_HP_MULT = 1.9;
@@ -103,10 +107,11 @@ const START_TIMER: Record<EnemyKind, number> = {
   anchor: 1.3,
   sentinel: 0.8,
   reverberant: 1.0,
+  husk: 0,
   boss: 0,
 };
 
-export function createEnemy(id: number, kind: EnemyKind, pos: Vec2, elite = false): EnemyState {
+export function createEnemy(id: number, kind: EnemyKind, pos: Vec2, elite = false, introBreak = false): EnemyState {
   const maxHp = elite ? Math.round(BASE_MAX_HP[kind] * ELITE_HP_MULT) : BASE_MAX_HP[kind];
   return {
     id,
@@ -122,6 +127,8 @@ export function createEnemy(id: number, kind: EnemyKind, pos: Vec2, elite = fals
     invulnerable: false,
     dashResistant: kind === "boss",
     exposed: false,
+    armIntroBreak: introBreak,
+    introAttackFired: false,
     elite,
     orbitAngle: 0,
     orbitCooldown: 0,
@@ -382,6 +389,45 @@ function stepReverberant(e: EnemyState, playerPos: Vec2, dt: number): AIResult {
   return { velocity: { x: 0, y: 0 }, facing };
 }
 
+// --- Husk (fodder): no power family --- lighter and faster to kill than any
+// carrier, so it reads as disposable trash rather than a build decision. ----
+
+const HUSK_CHASE_SPEED = 180;
+const HUSK_MELEE_RANGE = 46;
+const HUSK_TELEGRAPH = 0.3;
+const HUSK_SLAM_RADIUS = 34;
+const HUSK_SLAM_DAMAGE = 8;
+const HUSK_RECOVER = 0.6;
+
+function stepHusk(e: EnemyState, playerPos: Vec2, dt: number): AIResult {
+  const facing = toward(e.pos, playerPos);
+  const d = distance(e.pos, playerPos);
+
+  if (e.phase === 1) {
+    e.timer -= dt;
+    if (e.timer <= 0) {
+      e.phase = 2;
+      e.timer = HUSK_RECOVER;
+      return { velocity: { x: 0, y: 0 }, facing, slam: { radius: HUSK_SLAM_RADIUS, damage: HUSK_SLAM_DAMAGE } };
+    }
+    return { velocity: { x: 0, y: 0 }, facing };
+  }
+
+  if (e.phase === 2) {
+    e.timer -= dt;
+    if (e.timer <= 0) e.phase = 0;
+    return { velocity: { x: 0, y: 0 }, facing };
+  }
+
+  if (d <= HUSK_MELEE_RANGE) {
+    e.phase = 1;
+    e.timer = HUSK_TELEGRAPH;
+    e.telegraphDuration = HUSK_TELEGRAPH;
+    return { velocity: { x: 0, y: 0 }, facing };
+  }
+  return { velocity: { x: facing.x * HUSK_CHASE_SPEED, y: facing.y * HUSK_CHASE_SPEED }, facing };
+}
+
 // --- Boss: cycles ranged / charge / guard, exposes a window once below half HP
 
 const BOSS_EXPOSE_HP_RATIO = 0.5;
@@ -498,6 +544,8 @@ export function stepEnemyAI(e: EnemyState, playerPos: Vec2, dt: number): AIResul
       return stepSentinel(e, playerPos, dt);
     case "reverberant":
       return stepReverberant(e, playerPos, dt);
+    case "husk":
+      return stepHusk(e, playerPos, dt);
     case "boss":
       return stepBoss(e, playerPos, dt);
   }
@@ -526,6 +574,7 @@ export interface EncounterSpawn {
   xf: number;
   yf: number;
   elite?: boolean;
+  introBreak?: boolean; // this spawn's own attack cycle opens BREAK, not player damage --- the opener only
 }
 
 export interface EncounterSpec {
@@ -547,32 +596,52 @@ export function createRun(rng: Rng): RunPlan {
   const kindB = FAMILY_ENEMY[b];
   const kindC = FAMILY_ENEMY[extra];
   const eliteKind = rng() < 0.5 ? kindA : kindB;
+  // The opener has to be able to demonstrate and complete its own attack on a
+  // timer, with no player damage involved --- sentinel never telegraphs at
+  // all, so it can never be the scripted intro carrier (see stepEnemies's
+  // armIntroBreak handling in game.ts).
+  const introKind = kindA === "sentinel" ? kindB : kindA;
 
   const encounters: EncounterSpec[] = [
-    // Opening: meet the first half of this run's headline pair alone.
-    { spawns: [{ kind: kindA, xf: 0.5, yf: 0.22 }] },
+    // Opening: a single power-carrier demonstrates its own attack, unprompted
+    // --- the player has no attack yet, only movement and dash. Its own cycle
+    // opens BREAK; dashing through it grants the player's first attack.
+    { spawns: [{ kind: introKind, xf: 0.5, yf: 0.22, introBreak: true }] },
     // Encounter 2: both halves of the headline pair, together --- which one
     // you dash-finish first decides which power you're playing with for the
     // rest of this fight, so the kill-order choice is live from here on.
+    // A pair of husks give the player's new stolen attack something disposable
+    // to use it on between the two real decisions.
     {
       spawns: [
         { kind: kindB, xf: 0.3, yf: 0.25 },
         { kind: kindA, xf: 0.72, yf: 0.2 },
+        { kind: "husk", xf: 0.15, yf: 0.55 },
+        { kind: "husk", xf: 0.85, yf: 0.55 },
       ],
     },
     // Encounter 3: a mixed composition using the run's third power to make
-    // the fight strategically interesting, not just numerically bigger.
+    // the fight strategically interesting, not just numerically bigger. One
+    // husk for pacing --- kept light so it doesn't dilute the three-carrier fight.
     {
       spawns: [
         { kind: kindC, xf: 0.5, yf: 0.18 },
         { kind: kindA, xf: 0.22, yf: 0.3 },
         { kind: kindB, xf: 0.78, yf: 0.3 },
+        { kind: "husk", xf: 0.5, yf: 0.55 },
       ],
     },
-    // Elite: a rare, enhanced version of one half of the headline pair.
-    { spawns: [{ kind: eliteKind, xf: 0.5, yf: 0.2, elite: true }] },
+    // Elite: a rare, enhanced version of one half of the headline pair, plus
+    // one husk for pacing.
+    {
+      spawns: [
+        { kind: eliteKind, xf: 0.5, yf: 0.2, elite: true },
+        { kind: "husk", xf: 0.5, yf: 0.55 },
+      ],
+    },
     // Final: the boss, palette-independent since it reacts to whatever the
-    // player actually built rather than to a fixed power.
+    // player actually built rather than to a fixed power. Already fully
+    // choreographed via the stolen-core mechanic --- no husks.
     { spawns: [{ kind: "boss", xf: 0.5, yf: 0.2 }] },
   ];
 

@@ -255,8 +255,10 @@ const ANCHOR_COLOR: [number, number, number] = FAMILY_COLOR.blackhole;
 const SENTINEL_COLOR: [number, number, number] = FAMILY_COLOR.orbit;
 const REVERBERANT_COLOR: [number, number, number] = FAMILY_COLOR.echo;
 const BOSS_COLOR: [number, number, number] = [120, 40, 90];
+const HUSK_COLOR: [number, number, number] = [110, 105, 95]; // dull grey/clay --- no family hue, reads as disposable
 const FLASH: [number, number, number] = [255, 255, 255];
 const ELITE_TRIM: [number, number, number] = [255, 220, 90];
+const BREAK_RING: [number, number, number] = [255, 255, 255]; // generic BREAK glow, distinct from the elite trim
 
 function telegraphFill(base: [number, number, number], ratio: number, clock: number): string {
   if (ratio <= 0) return `rgb(${base.join(",")})`;
@@ -277,6 +279,7 @@ export function drawEnemy(ctx: CanvasRenderingContext2D, pose: EnemyPose): void 
   else if (pose.kind === "anchor") drawAnchor(ctx, pose);
   else if (pose.kind === "sentinel") drawSentinel(ctx, pose);
   else if (pose.kind === "reverberant") drawReverberant(ctx, pose);
+  else if (pose.kind === "husk") drawHusk(ctx, pose);
   else drawBoss(ctx, pose);
 
   if (pose.elite) {
@@ -284,6 +287,17 @@ export function drawEnemy(ctx: CanvasRenderingContext2D, pose: EnemyPose): void 
     ctx.strokeStyle = `rgba(${ELITE_TRIM.join(",")},${0.6 + 0.4 * Math.sin(pose.clock * 10)})`;
     ctx.lineWidth = 2.5;
     ctx.arc(0, 0, pose.radius * 1.25, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Generic BREAK glow: any exposed enemy (scripted opener or a weakened
+  // carrier) reads the same way everywhere, distinct in radius/color from the
+  // elite trim so the two can co-occur legibly on a weakened elite carrier.
+  if (pose.exposed) {
+    ctx.beginPath();
+    ctx.strokeStyle = `rgba(${BREAK_RING.join(",")},${0.5 + 0.5 * Math.sin(pose.clock * 14)})`;
+    ctx.lineWidth = 3;
+    ctx.arc(0, 0, pose.radius * 1.5, 0, Math.PI * 2);
     ctx.stroke();
   }
 
@@ -415,6 +429,31 @@ function drawReverberant(ctx: CanvasRenderingContext2D, pose: EnemyPose): void {
   ctx.lineWidth = 1.5;
   ctx.arc(0, 0, r * (1 + echoT * 0.6), 0, Math.PI * 2);
   ctx.stroke();
+}
+
+function drawHusk(ctx: CanvasRenderingContext2D, pose: EnemyPose): void {
+  // Fodder: no family hue, no telegraph flourish beyond the shared flash ---
+  // deliberately reads as lesser and disposable next to any power-carrier.
+  const r = pose.radius;
+  const fill = telegraphFill(HUSK_COLOR, pose.telegraphRatio, pose.clock);
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.lineTo(r * 0.65, -r * 0.15);
+  ctx.lineTo(r * 0.4, r * 0.85);
+  ctx.lineTo(-r * 0.4, r * 0.85);
+  ctx.lineTo(-r * 0.65, -r * 0.15);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(20,18,15,0.5)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.fillStyle = "rgba(15,12,10,0.7)";
+  ctx.arc(-r * 0.16, -r * 0.15, r * 0.09, 0, Math.PI * 2);
+  ctx.arc(r * 0.16, -r * 0.15, r * 0.09, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function drawBoss(ctx: CanvasRenderingContext2D, pose: EnemyPose): void {

@@ -96,7 +96,10 @@ export function createRenderer(canvas: HTMLCanvasElement) {
       drawPlayerGroundRing(ctx, state, clock);
       drawPlayer(ctx, playerPose(state, 0, clock));
     }
-    if (state.phase !== "dead" && state.phase !== "cleared") drawPowerPrompt(ctx, vfx, state);
+    if (state.phase !== "dead" && state.phase !== "cleared") {
+      drawPowerPrompt(ctx, vfx, state);
+      drawStealPrompt(ctx, state, clock);
+    }
 
     if (transitionFlash > 0) drawTransitionFlash(ctx, width, height, transitionFlash);
 
@@ -421,6 +424,40 @@ function drawPowerPrompt(ctx: CanvasRenderingContext2D, vfx: VfxState, state: Ga
   ctx.restore();
 }
 
+// A BREAK'd carrier stays that way until dashed into, so this prompt holds
+// steady (with a gentle pulse) rather than fading like the one-shot power
+// prompt above --- and it loops over every exposed enemy, since encounters
+// 2/3 can have more than one carrier in BREAK at once.
+function drawStealPrompt(ctx: CanvasRenderingContext2D, state: GameState, clock: number): void {
+  for (const enemy of state.enemies) {
+    if (!enemy.alive || !enemy.exposed) continue;
+    const pulse = 0.75 + 0.25 * Math.sin(clock * 8);
+    const x = enemy.pos.x;
+    const y = enemy.pos.y - ENEMY_RADIUS[enemy.kind] - 26;
+
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    ctx.translate(x, y);
+
+    const pillW = 96;
+    const pillH = 26;
+    roundedRect(ctx, -pillW / 2, -pillH / 2, pillW, pillH, 13);
+    ctx.fillStyle = "rgba(8,9,13,0.85)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,235,150,0.6)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(255,235,150,0.95)";
+    ctx.font = "bold 11px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("[SPACE] STEAL", 0, 0.5);
+
+    ctx.restore();
+  }
+}
+
 // --- HUD: health / boss bars ---------------------------------------------------
 
 function drawHealthBar(ctx: CanvasRenderingContext2D, health: number, width: number): void {
@@ -520,6 +557,12 @@ function drawAbilityBar(ctx: CanvasRenderingContext2D, state: GameState, width: 
   const y = height - size - 26;
 
   for (const slot of slots) {
+    // Before the first STEAL, LMB has no attack behind it --- mute the whole
+    // slot so the neutral-dot fallback doesn't read as a live button.
+    const muted = slot.kind === "attack" && !p.build.main;
+    ctx.save();
+    if (muted) ctx.globalAlpha *= 0.35;
+
     drawSlotFrame(ctx, x, y, size);
     const cx = x + size / 2;
     const cy = y + size / 2;
@@ -548,6 +591,7 @@ function drawAbilityBar(ctx: CanvasRenderingContext2D, state: GameState, width: 
 
     if (slot.key) drawKeyTag(ctx, cx, y + size + 3, slot.key);
 
+    ctx.restore();
     x += size + gap;
   }
 }

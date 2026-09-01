@@ -3,11 +3,13 @@
 // owns what is true, so a spec test can import `step` and assert a rule
 // directly against state, without touching a browser.
 //
-// Core loop: FIGHT -> STEAL -> COUNTER -> BUILD -> ADAPT. Every non-boss
-// enemy belongs to a power family (enemies.ts's ENEMY_FAMILY) and can only
-// be finished off by a dash --- ordinary damage floors at 1hp, so stealing a
-// power always requires actually landing the dash, and dash itself never
-// out-damages using what you stole.
+// Core loop: FIGHT -> STEAL -> COUNTER -> BUILD -> ADAPT. The player starts
+// with no attack at all --- the first one is always stolen. Power-carrier
+// enemies (enemies.ts's ENEMY_FAMILY) float their hp at 1 and enter BREAK
+// (exposed + invulnerable) once sufficiently weakened; only a dash landing
+// on a BREAK'd carrier finishes it and steals its power. Fodder enemies
+// (husk) belong to no family and just die to ordinary damage --- no
+// execution needed, no build decision attached.
 //
 // Iteration 5: every power changes what an attack *does* (teleport, throw-
 // and-return, summon a second attacker, set a trap, stand in a zone, replay
@@ -107,7 +109,7 @@ export interface Input {
 
 export const PLAYER_RADIUS = 16;
 export const ENEMY_RADIUS: Record<EnemyKind, number> = {
-  phantom: 18, thrower: 20, duplicate: 22, anchor: 28, sentinel: 26, reverberant: 18, boss: 42,
+  phantom: 18, thrower: 20, duplicate: 22, anchor: 28, sentinel: 26, reverberant: 18, husk: 16, boss: 42,
 };
 export const PROJECTILE_RADIUS = 6;
 export const PLAYER_MAX_HEALTH = 100;
@@ -130,7 +132,17 @@ function distance(a: Vec2, b: Vec2): number { return Math.hypot(a.x - b.x, a.y -
 
 function damageEnemy(enemy: EnemyState, amount: number): void {
   enemy.hp -= amount;
-  if (!enemy.exposed && enemy.hp <= 0) enemy.hp = 1;
+  const carrier = ENEMY_FAMILY[enemy.kind];
+  if (!carrier) return; // fodder (husk): real damage, real death via resolveDeaths
+  if (enemy.kind === "boss") {
+    if (!enemy.exposed && enemy.hp <= 0) enemy.hp = 1;
+    return;
+  }
+  if (!enemy.exposed && enemy.hp <= 0) {
+    enemy.hp = 1;
+    enemy.exposed = true;
+    enemy.invulnerable = true;
+  }
 }
 
 function clampToArena(pos: Vec2, radius: number, width: number, height: number): Vec2 {
@@ -167,7 +179,9 @@ function anyEvent(e: GameEvents): boolean {
 
 function spawnEncounter(encounters: EncounterSpec[], index: number, arena: Arena, nextId: number): { enemies: EnemyState[]; nextId: number } {
   const spec = encounters[index];
-  const enemies = spec.spawns.map((s) => createEnemy(nextId++, s.kind, { x: arena.width * s.xf, y: arena.height * s.yf }, s.elite ?? false));
+  const enemies = spec.spawns.map((s) =>
+    createEnemy(nextId++, s.kind, { x: arena.width * s.xf, y: arena.height * s.yf }, s.elite ?? false, s.introBreak ?? false),
+  );
   return { enemies, nextId };
 }
 
@@ -279,7 +293,7 @@ function stepPlayer(draft: GameState, input: Input, dt: number): void {
   }
   player.pos = clampToArena({ x: player.pos.x + velocity.x * dt, y: player.pos.y + velocity.y * dt }, PLAYER_RADIUS, draft.arena.width, draft.arena.height);
 
-  if (input.attackPressed && player.attackCooldown === 0) {
+  if (input.attackPressed && player.attackCooldown === 0 && player.build.main) {
     performAttack(draft, input.attackTarget);
     player.attackCooldown = cooldownFor(player.build);
   }
@@ -503,6 +517,7 @@ function performEchoStrike(draft: GameState, direction: Vec2): void {
 function performAttack(draft: GameState, aimAt: Vec2): void {
   const player = draft.player;
   const build = player.build;
+  if (!build.main) return; // the player has no attack until their first STEAL
   const aim = normalize({ x: aimAt.x - player.pos.x, y: aimAt.y - player.pos.y });
   const direction = aim.x === 0 && aim.y === 0 ? player.facing : aim;
 
@@ -525,8 +540,6 @@ function performAttack(draft: GameState, aimAt: Vec2): void {
     case "echo":
       performEchoStrike(draft, direction);
       return;
-    default:
-      coneHit(draft, player.pos, direction, BASIC_RANGE, BASIC_ARC, (enemy) => damageEnemy(enemy, BASIC_DAMAGE));
   }
 }
 
@@ -827,7 +840,8 @@ function resolveDash(draft: GameState): void {
     if (!enemy.alive) continue;
     if (distance(player.pos, enemy.pos) > PLAYER_RADIUS + ENEMY_RADIUS[enemy.kind]) continue;
     if (enemy.dashResistant) continue;
-    if (enemy.kind !== "boss" && enemy.hp > 1) {
+    const carrier = ENEMY_FAMILY[enemy.kind];
+    if (carrier && !enemy.exposed) {
       enemy.phase = 0; enemy.timer = Math.max(enemy.timer, 0.2);
       draft.events.dashInterrupt = { ...enemy.pos };
       continue;
@@ -1007,6 +1021,11 @@ function stepEnemies(draft: GameState, dt: number): void {
     if (!enemy.alive) continue;
     enemy.orbitCooldown = Math.max(0, enemy.orbitCooldown - dt);
 
+    if (enemy.exposed && enemy.kind !== "boss") {
+      draft.events.bossExposed = true;
+      continue; // frozen in BREAK --- stands still, glowing, waiting for a dash
+    }
+
     const result = stepEnemyAI(enemy, draft.player.pos, dt);
 
     if (result.teleportTo) {
@@ -1042,6 +1061,19 @@ function stepEnemies(draft: GameState, dt: number): void {
     }
     if (result.slam && distance(enemy.pos, draft.player.pos) <= result.slam.radius + PLAYER_RADIUS) {
       applyDamageToPlayer(draft, result.slam.damage);
+    }
+
+    if (enemy.armIntroBreak) {
+      // Track "has telegraphed at least once" persistently rather than a
+      // single-frame edge check: sentinel never telegraphs at all, and
+      // anchor's real damage lands on a second phase transition well after
+      // its first --- both would misfire against a naive one-frame check.
+      if (enemy.phase % 10 === 1) enemy.introAttackFired = true;
+      if (enemy.introAttackFired && enemy.phase === 0) {
+        enemy.exposed = true;
+        enemy.invulnerable = true;
+        enemy.armIntroBreak = false;
+      }
     }
 
     if (enemy.exposed) draft.events.bossExposed = true;
